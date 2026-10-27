@@ -73,6 +73,7 @@ import {
   Openai,
   ProviderSession,
   QrCode,
+  RetryResend,
   S3,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
@@ -224,6 +225,17 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+type RetryResendDecision = 'allowed' | 'too_old' | 'rate_limited' | 'not_found';
+
+type RetryResendReport = {
+  windowStartedAt: string;
+  allowed: number;
+  tooOld: number;
+  rateLimited: number;
+  notFound: number;
+  samples: { remoteJid: string; messageId: string; ageSeconds: number | null; decision: RetryResendDecision }[];
+};
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -247,6 +259,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private authStateProvider: AuthStateProvider;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
+  private retryResendTimestamps: number[] = [];
+  private retryResendReport: RetryResendReport | null = null;
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
@@ -532,24 +546,151 @@ export class BaileysStartupService extends ChannelStartupService {
       if (full) {
         return webMessageInfo[0];
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
-        const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
+
+      // Baileys only skips a retry resend when getMessage resolves to a falsy value. Returning an
+      // object here (for example `{ conversation: '' }`) makes it relay an EMPTY message reusing the
+      // original message id, which shows up in the chat as a bubble with a timestamp and no content.
+      const message = webMessageInfo[0]?.message;
+
+      if (!message) {
+        return undefined;
+      }
+
+      if (message.pollCreationMessage) {
+        const messageSecretBase64 = message.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
           const messageSecret = Buffer.from(messageSecretBase64, 'base64');
 
           const msg = {
             messageContextInfo: { messageSecret },
-            pollCreationMessage: webMessageInfo[0].message?.pollCreationMessage,
+            pollCreationMessage: message.pollCreationMessage,
           };
 
           return msg;
         }
       }
 
-      return webMessageInfo[0].message;
-    } catch {
-      return { conversation: '' };
+      return message;
+    } catch (error) {
+      this.logger.error(`getMessage: lookup for ${key.id} failed: ${error?.toString()}`);
+
+      return undefined;
+    }
+  }
+
+  /**
+   * What Baileys resends when another device sends a retry receipt.
+   *
+   * Upstream answers with any stored message, however old. After a reconnect a single device may ask
+   * for every message it missed, and when the requester is a primary device Baileys relays each one
+   * to the WHOLE group (`sendToAll` in sendMessagesAgain): dozens of old messages land seconds apart,
+   * which puts the number at risk of a ban. Only recent messages are resent, at a capped pace per
+   * instance; every decision is reported to the instance webhook as a `retry.resend` event.
+   */
+  private async getMessageForRetry(key: proto.IMessageKey): Promise<proto.IMessage | undefined> {
+    const stored = (await this.getMessage(key, true)) as proto.IWebMessageInfo | undefined;
+
+    if (!stored?.message) {
+      this.recordRetryResend(key, null, 'not_found');
+
+      return undefined;
+    }
+
+    // Baileys also calls getMessage to decrypt event responses: that is a lookup, not a resend.
+    if (stored.message.eventMessage) {
+      return stored.message;
+    }
+
+    const limits = this.configService.get<RetryResend>('RETRY_RESEND');
+    const ageSeconds = Math.floor(Date.now() / 1000) - Number(stored.messageTimestamp);
+
+    // A NaN age (missing timestamp) fails the comparison too, so unknown ages are never resent.
+    if (!(ageSeconds <= limits.MAX_AGE_SECONDS)) {
+      this.recordRetryResend(key, ageSeconds, 'too_old');
+
+      return undefined;
+    }
+
+    const now = Date.now();
+    this.retryResendTimestamps = this.retryResendTimestamps.filter((timestamp) => now - timestamp < 60_000);
+
+    if (this.retryResendTimestamps.length >= limits.MAX_PER_MINUTE) {
+      this.recordRetryResend(key, ageSeconds, 'rate_limited');
+
+      return undefined;
+    }
+
+    this.retryResendTimestamps.push(now);
+    this.recordRetryResend(key, ageSeconds, 'allowed');
+
+    return (await this.getMessage(key)) as proto.IMessage | undefined;
+  }
+
+  private recordRetryResend(key: proto.IMessageKey, ageSeconds: number | null, decision: RetryResendDecision) {
+    this.logger.warn(`retry resend ${decision}: ${key.remoteJid} ${key.id} (age ${ageSeconds ?? '?'}s)`);
+
+    if (!this.retryResendReport) {
+      this.retryResendReport = {
+        windowStartedAt: new Date().toISOString(),
+        allowed: 0,
+        tooOld: 0,
+        rateLimited: 0,
+        notFound: 0,
+        samples: [],
+      };
+
+      // One report per instance per window, however many retry receipts arrive meanwhile.
+      setTimeout(() => void this.flushRetryResendReport(), 60_000).unref();
+    }
+
+    const counters: Record<RetryResendDecision, 'allowed' | 'tooOld' | 'rateLimited' | 'notFound'> = {
+      allowed: 'allowed',
+      too_old: 'tooOld',
+      rate_limited: 'rateLimited',
+      not_found: 'notFound',
+    };
+    this.retryResendReport[counters[decision]]++;
+
+    if (this.retryResendReport.samples.length < 20) {
+      this.retryResendReport.samples.push({ remoteJid: key.remoteJid, messageId: key.id, ageSeconds, decision });
+    }
+  }
+
+  /**
+   * Posts straight to the instance webhook instead of going through sendDataWebhook: a new entry in
+   * Events would ripple through every event integration and require every instance to re-subscribe.
+   */
+  private async flushRetryResendReport() {
+    const report = this.retryResendReport;
+    this.retryResendReport = null;
+
+    if (!report) {
+      return;
+    }
+
+    const data = { ...report, windowEndedAt: new Date().toISOString() };
+
+    // The deployment logs at ERROR only; this keeps a trace even when the webhook is unreachable.
+    this.logger.error(
+      `retry resend report: allowed=${data.allowed} tooOld=${data.tooOld} ` +
+        `rateLimited=${data.rateLimited} notFound=${data.notFound}`,
+    );
+
+    try {
+      const webhook = await this.prismaRepository.webhook.findUnique({ where: { instanceId: this.instanceId } });
+
+      if (!webhook?.enabled || !webhook.url) {
+        return;
+      }
+
+      await axios.post(
+        webhook.url,
+        { event: 'retry.resend', instance: this.instance.name, date_time: new Date().toISOString(), data },
+        { timeout: 5_000 },
+      );
+    } catch (error) {
+      this.logger.error(`retry resend report: webhook failed: ${error?.toString()}`);
     }
   }
 
@@ -646,7 +787,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
-      getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
+      getMessage: async (key) => await this.getMessageForRetry(key),
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
