@@ -73,7 +73,6 @@ import {
   Openai,
   ProviderSession,
   QrCode,
-  RetryResend,
   S3,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
@@ -225,15 +224,18 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
-type RetryResendDecision = 'allowed' | 'too_old' | 'rate_limited' | 'not_found';
+type RetryRequest = {
+  remoteJid: string;
+  participant: string | null;
+  messageId: string;
+  ageSeconds: number | null;
+};
 
-type RetryResendReport = {
+type RetryRequestReport = {
   windowStartedAt: string;
-  allowed: number;
-  tooOld: number;
-  rateLimited: number;
+  requested: number;
   notFound: number;
-  samples: { remoteJid: string; messageId: string; ageSeconds: number | null; decision: RetryResendDecision }[];
+  requests: RetryRequest[];
 };
 
 export class BaileysStartupService extends ChannelStartupService {
@@ -259,8 +261,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private authStateProvider: AuthStateProvider;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private retryResendTimestamps: number[] = [];
-  private retryResendReport: RetryResendReport | null = null;
+  private retryRequestReport: RetryRequestReport | null = null;
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
@@ -580,80 +581,53 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
-   * What Baileys resends when another device sends a retry receipt.
+   * What Baileys resends when another device sends a retry receipt: always nothing.
    *
    * Upstream answers with any stored message, however old. After a reconnect a single device may ask
    * for every message it missed, and when the requester is a primary device Baileys relays each one
    * to the WHOLE group (`sendToAll` in sendMessagesAgain): dozens of old messages land seconds apart,
-   * which puts the number at risk of a ban. Only recent messages are resent, at a capped pace per
-   * instance; every decision is reported to the instance webhook as a `retry.resend` event.
+   * which puts the number at risk of a ban. No message is ever resent; every request is reported to
+   * the instance webhook as a `retry.resend` event for auditing.
    */
   private async getMessageForRetry(key: proto.IMessageKey): Promise<proto.IMessage | undefined> {
     const stored = (await this.getMessage(key, true)) as proto.IWebMessageInfo | undefined;
 
-    if (!stored?.message) {
-      this.recordRetryResend(key, null, 'not_found');
-
-      return undefined;
-    }
-
     // Baileys also calls getMessage to decrypt event responses: that is a lookup, not a resend.
-    if (stored.message.eventMessage) {
+    if (stored?.message?.eventMessage) {
       return stored.message;
     }
 
-    const limits = this.configService.get<RetryResend>('RETRY_RESEND');
-    const ageSeconds = Math.floor(Date.now() / 1000) - Number(stored.messageTimestamp);
+    const ageSeconds = stored?.message ? Math.floor(Date.now() / 1000) - Number(stored.messageTimestamp) : null;
 
-    // A NaN age (missing timestamp) fails the comparison too, so unknown ages are never resent.
-    if (!(ageSeconds <= limits.MAX_AGE_SECONDS)) {
-      this.recordRetryResend(key, ageSeconds, 'too_old');
+    this.recordRetryRequest(key, ageSeconds, !stored?.message);
 
-      return undefined;
-    }
-
-    const now = Date.now();
-    this.retryResendTimestamps = this.retryResendTimestamps.filter((timestamp) => now - timestamp < 60_000);
-
-    if (this.retryResendTimestamps.length >= limits.MAX_PER_MINUTE) {
-      this.recordRetryResend(key, ageSeconds, 'rate_limited');
-
-      return undefined;
-    }
-
-    this.retryResendTimestamps.push(now);
-    this.recordRetryResend(key, ageSeconds, 'allowed');
-
-    return (await this.getMessage(key)) as proto.IMessage | undefined;
+    return undefined;
   }
 
-  private recordRetryResend(key: proto.IMessageKey, ageSeconds: number | null, decision: RetryResendDecision) {
-    this.logger.warn(`retry resend ${decision}: ${key.remoteJid} ${key.id} (age ${ageSeconds ?? '?'}s)`);
+  private recordRetryRequest(key: proto.IMessageKey, ageSeconds: number | null, notFound: boolean) {
+    this.logger.warn(`retry request refused: ${key.remoteJid} ${key.id} from ${key.participant ?? '?'}`);
 
-    if (!this.retryResendReport) {
-      this.retryResendReport = {
-        windowStartedAt: new Date().toISOString(),
-        allowed: 0,
-        tooOld: 0,
-        rateLimited: 0,
-        notFound: 0,
-        samples: [],
-      };
+    if (!this.retryRequestReport) {
+      this.retryRequestReport = { windowStartedAt: new Date().toISOString(), requested: 0, notFound: 0, requests: [] };
 
       // One report per instance per window, however many retry receipts arrive meanwhile.
-      setTimeout(() => void this.flushRetryResendReport(), 60_000).unref();
+      setTimeout(() => void this.flushRetryRequestReport(), 60_000).unref();
     }
 
-    const counters: Record<RetryResendDecision, 'allowed' | 'tooOld' | 'rateLimited' | 'notFound'> = {
-      allowed: 'allowed',
-      too_old: 'tooOld',
-      rate_limited: 'rateLimited',
-      not_found: 'notFound',
-    };
-    this.retryResendReport[counters[decision]]++;
+    this.retryRequestReport.requested++;
 
-    if (this.retryResendReport.samples.length < 20) {
-      this.retryResendReport.samples.push({ remoteJid: key.remoteJid, messageId: key.id, ageSeconds, decision });
+    if (notFound) {
+      this.retryRequestReport.notFound++;
+    }
+
+    // Bounded so a storm cannot grow the payload without limit; `requested` keeps the real total.
+    if (this.retryRequestReport.requests.length < 500) {
+      this.retryRequestReport.requests.push({
+        remoteJid: key.remoteJid,
+        participant: key.participant ?? null,
+        messageId: key.id,
+        ageSeconds: Number.isFinite(ageSeconds) ? ageSeconds : null,
+      });
     }
   }
 
@@ -661,9 +635,9 @@ export class BaileysStartupService extends ChannelStartupService {
    * Posts straight to the instance webhook instead of going through sendDataWebhook: a new entry in
    * Events would ripple through every event integration and require every instance to re-subscribe.
    */
-  private async flushRetryResendReport() {
-    const report = this.retryResendReport;
-    this.retryResendReport = null;
+  private async flushRetryRequestReport() {
+    const report = this.retryRequestReport;
+    this.retryRequestReport = null;
 
     if (!report) {
       return;
@@ -672,10 +646,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const data = { ...report, windowEndedAt: new Date().toISOString() };
 
     // The deployment logs at ERROR only; this keeps a trace even when the webhook is unreachable.
-    this.logger.error(
-      `retry resend report: allowed=${data.allowed} tooOld=${data.tooOld} ` +
-        `rateLimited=${data.rateLimited} notFound=${data.notFound}`,
-    );
+    this.logger.error(`retry requests refused: requested=${data.requested} notFound=${data.notFound}`);
 
     try {
       const webhook = await this.prismaRepository.webhook.findUnique({ where: { instanceId: this.instanceId } });
@@ -690,7 +661,7 @@ export class BaileysStartupService extends ChannelStartupService {
         { timeout: 5_000 },
       );
     } catch (error) {
-      this.logger.error(`retry resend report: webhook failed: ${error?.toString()}`);
+      this.logger.error(`retry requests report: webhook failed: ${error?.toString()}`);
     }
   }
 

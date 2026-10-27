@@ -314,7 +314,6 @@ export type Webhook = {
 export type Pusher = { ENABLED: boolean; GLOBAL?: GlobalPusher; EVENTS: EventsPusher };
 export type ConfigSessionPhone = { CLIENT: string; NAME: string };
 export type QrCode = { LIMIT: number; COLOR: string };
-export type RetryResend = { MAX_AGE_SECONDS: number; MAX_PER_MINUTE: number };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
   ENABLED: boolean;
@@ -412,7 +411,6 @@ export interface Env {
   PUSHER: Pusher;
   CONFIG_SESSION_PHONE: ConfigSessionPhone;
   QRCODE: QrCode;
-  RETRY_RESEND: RetryResend;
   TYPEBOT: Typebot;
   CHATWOOT: Chatwoot;
   OPENAI: Openai;
@@ -805,11 +803,6 @@ export class ConfigService {
       QRCODE: {
         LIMIT: Number.parseInt(process.env.QRCODE_LIMIT) || 30,
         COLOR: process.env.QRCODE_COLOR || '#198754',
-      },
-      RETRY_RESEND: {
-        // Unset uses the default; 0 or an invalid value refuses every resend (fail safe).
-        MAX_AGE_SECONDS: Number.parseInt(process.env.RETRY_RESEND_MAX_AGE_SECONDS ?? '300') || 0,
-        MAX_PER_MINUTE: Number.parseInt(process.env.RETRY_RESEND_MAX_PER_MINUTE ?? '3') || 0,
       },
       TYPEBOT: {
         ENABLED: process.env?.TYPEBOT_ENABLED === 'true',
